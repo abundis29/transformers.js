@@ -80,10 +80,11 @@ import {
     std_mean,
     Tensor,
 } from './utils/tensor.js';
-
+// import { env } from './env.js';
 import { executionProviders, ONNX } from './backends/onnx.js';
 import { medianFilter } from './transformers.js';
 const { InferenceSession, Tensor: ONNXTensor, env } = ONNX;
+const IS_BROWSER = typeof navigator !== 'undefined' && navigator.product !== 'ReactNative';
 
 /** @typedef {import('onnxruntime-web').InferenceSession} InferenceSession */
 
@@ -128,7 +129,7 @@ async function constructSession(pretrained_model_name_or_path, fileName, options
         });
     } catch (err) {
         // If the execution provided was only wasm, throw the error
-        if (executionProviders.length === 1 && executionProviders[0] === 'wasm') {
+        if (!env.allowFallback || executionProviders.length === 1 && executionProviders[0] === 'wasm') {
             throw err;
         }
 
@@ -137,6 +138,7 @@ async function constructSession(pretrained_model_name_or_path, fileName, options
             'Something went wrong during model construction (most likely a missing operation). ' +
             'Using `wasm` as a fallback. '
         )
+        
         return await InferenceSession.create(buffer, {
             executionProviders: ['wasm']
         });
@@ -211,6 +213,13 @@ async function sessionRun(session, inputs) {
         // This usually occurs when the inputs are of the wrong type.
         console.error(`An error occurred during model execution: "${e}".`);
         console.error('Inputs given to model:', checkedInputs);
+        console.error(
+            'Inputs given to model:',
+            IS_BROWSER ? checkedInputs : Object.fromEntries(
+                Object.entries(checkedInputs)
+                    .map(([key, tensor]) => [key, { dims: tensor.dims, type: tensor.type }])
+            )
+        );
         throw e;
     }
 }

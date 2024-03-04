@@ -21,6 +21,16 @@ export function dispatchCallback(progress_callback, data) {
 }
 
 /**
+ * Check if a value is a string.
+ * @param {*} text The value to check.
+ * @returns {boolean} True if the value is a string, false otherwise.
+ */
+export function isString(text) {
+    return typeof text === 'string' || text instanceof String
+}
+
+
+/**
  * Reverses the keys and values of an object.
  *
  * @param {Object} data The object to reverse.

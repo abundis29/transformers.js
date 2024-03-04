@@ -20,25 +20,28 @@
 // In either case, we select the default export if it exists, otherwise we use the named export.
 import * as ONNX_NODE from 'onnxruntime-node';
 import * as ONNX_WEB from 'onnxruntime-web';
+import * as ONNX_COMMON from 'onnxruntime-common';
 
 /** @type {import('onnxruntime-web')} The ONNX runtime module. */
-export let ONNX;
+export const ONNX = ONNX_COMMON?.default ?? ONNX_COMMON;
+
 
 export const executionProviders = [
     // 'webgpu',
     'wasm'
 ];
 
-if (typeof process !== 'undefined' && process?.release?.name === 'node') {
+if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
     // Running in a node-like environment.
-    ONNX = ONNX_NODE.default ?? ONNX_NODE;
-
+    import('onnxruntime-react-native');
     // Add `cpu` execution provider, with higher precedence that `wasm`.
     executionProviders.unshift('cpu');
 
 } else {
     // Running in a browser-environment
-    ONNX = ONNX_WEB.default ?? ONNX_WEB;
+
+    import('onnxruntime-node');
+    import('onnxruntime-web');
 
     // SIMD for WebAssembly does not operate correctly in some recent versions of iOS (16.4.x).
     // As a temporary fix, we disable it for now.
@@ -46,5 +49,6 @@ if (typeof process !== 'undefined' && process?.release?.name === 'node') {
     const isIOS = typeof navigator !== 'undefined' && /iP(hone|od|ad).+16_4.+AppleWebKit/.test(navigator.userAgent);
     if (isIOS) {
         ONNX.env.wasm.simd = false;
+        ONNX_COMMON.env.wasm.simd = false;
     }
 }

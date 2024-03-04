@@ -8,7 +8,9 @@
 import fs from 'fs';
 import path from 'path';
 import stream from 'stream/web';
+import { Buffer } from 'buffer';
 
+const IS_REACT_NATIVE = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
 import { env } from '../env.js';
 import { dispatchCallback } from './core.js';
 
@@ -32,6 +34,49 @@ if (!globalThis.ReadableStream) {
  * @property {string} [model_file_name=null] If specified, load the model with this name (excluding the .onnx suffix). Currently only valid for encoder- or decoder-only models.
  */
 
+class FileHeaders extends Headers {
+    constructor(...args) {
+        super();
+        this.headers = {};
+        Object.assign(this.headers, ...args);
+    }
+
+    get(key) {
+        return this.headers[key];
+    }
+
+    set(key, value) {
+        this.headers[key] = value;
+    }
+
+    clone() {
+        return new FileHeaders(this.headers);
+    }
+}
+
+/**
+* Returns the MIME type for the file specified by the given path.
+* 
+* @param {string} path The path to the file.
+* @returns {string} The MIME type for the file specified by the given path.
+*/
+function getMIME(path) {
+    const CONTENT_TYPE_MAP = {
+        'txt': 'text/plain',
+        'html': 'text/html',
+        'css': 'text/css',
+        'js': 'text/javascript',
+        'json': 'application/json',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+    }
+    const extension = path.split('.').pop().toLowerCase();
+    return CONTENT_TYPE_MAP[extension] ?? 'application/octet-stream';
+}
+
+
 class FileResponse {
     /**
      * Mapping from file extensions to MIME types.
@@ -47,13 +92,15 @@ class FileResponse {
         'jpeg': 'image/jpeg',
         'gif': 'image/gif',
     }
+
+
     /**
      * Creates a new `FileResponse` object.
      * @param {string|URL} filePath
      */
     constructor(filePath) {
         this.filePath = filePath;
-        this.headers = new Headers();
+        this.headers = new FileHeaders();
 
         this.exists = fs.existsSync(filePath);
         if (this.exists) {
@@ -81,6 +128,9 @@ class FileResponse {
         }
     }
 
+
+
+
     /**
      * Updates the 'content-type' header property of the response based on the extension of
      * the file specified by the filePath property of the current object.
@@ -90,7 +140,10 @@ class FileResponse {
         // Set content-type header based on file extension
         const extension = this.filePath.toString().split('.').pop().toLowerCase();
         this.headers.set('content-type', this._CONTENT_TYPE_MAP[extension] ?? 'application/octet-stream');
+        // @ts-ignore
+        this.headers['content-type'] = getMIME(this.filePath);
     }
+
 
     /**
      * Clone the current FileResponse object.
@@ -101,7 +154,7 @@ class FileResponse {
         response.exists = this.exists;
         response.status = this.status;
         response.statusText = this.statusText;
-        response.headers = new Headers(this.headers);
+        response.headers = new FileHeaders(this.headers);
         return response;
     }
 
@@ -151,6 +204,119 @@ class FileResponse {
 }
 
 /**
+ * Parse HTTP headers.
+ * 
+ * @function parseHeaders
+ * @param {string} rawHeaders
+ * @returns {Headers}
+ */
+function parseHeaders(rawHeaders) {
+    const headers = new Headers();
+    const preProcessedHeaders = rawHeaders.replace(/\r?\n[\t ]+/g, ' ');
+    preProcessedHeaders.split(/\r?\n/).forEach((line) => {
+        const parts = line.split(':');
+        const key = parts.shift().trim();
+        if (key) {
+            const value = parts.join(':').trim();
+            headers.append(key, value);
+        }
+    });
+    return headers;
+}
+
+/**
+ * Makes an HTTP request.
+ * 
+ * @function fetchBinary
+ * @param {string|URL} url
+ * @returns {Promise<Response>}
+ */
+// @ts-ignore
+function fetchBinary(url) {
+    return new Promise((resolve, reject) => {
+        const request = new Request(url);
+        const xhr = new XMLHttpRequest();
+
+        xhr.onload = () => {
+            const reqOptions = {
+                status: xhr.status,
+                statusText: xhr.statusText,
+                headers: parseHeaders(xhr.getAllResponseHeaders() || ''),
+                url: '',
+            };
+            reqOptions.url = 'responseURL' in xhr ?
+                xhr.responseURL :
+                reqOptions.headers.get('x-request-url');
+
+            const body = Buffer.from(xhr.response);
+
+            resolve(new Response(body.buffer, reqOptions));
+        };
+
+        xhr.onerror = () => reject(new TypeError('Network request failed'));
+        xhr.ontimeout = () => reject(new TypeError('Request timeout'));
+
+        xhr.open(request.method, request.url, true);
+
+        if (request.credentials === 'include') {
+            xhr.withCredentials = true;
+        } else if (request.credentials === 'omit') {
+            xhr.withCredentials = false;
+        }
+
+        xhr.responseType = 'arraybuffer';
+
+        request.headers.forEach((value, name) => {
+            xhr.setRequestHeader(name, value);
+        });
+
+        // @ts-ignore
+        xhr.send(request._bodyInit ?? null);
+    });
+}
+
+// @ts-ignore
+// @ts-ignore
+/**
+ * Makes an FS request for ReactNative.
+ * @async
+ * @function readFile
+ * @param {string | URL} allowFilePath
+ * @param {object} filePath
+ * @returns {Promise<Response>}
+ */
+// @ts-ignore
+async function readFile(filePath, allowFilePath = false) {
+    const path = filePath.toString()
+    // @ts-ignore
+    const stat = await fs.stat(path);
+    const headers = new Headers();
+    // @ts-ignore
+    headers.append('content-length', stat.size);
+    const type = getMIME(path);
+    headers.append('content-type', type);
+    headers.append('rn-is-local', '1');
+    // @ts-ignore
+    let content;
+    const reqOptions = {
+        status: 200,
+        statusText: 'OK',
+        headers,
+        url: `file://${path}`,
+    };
+    // Prevent load binary data into JS side
+    if (type !== 'application/octet-stream') {
+        // @ts-ignore
+        const content = await fs.readFile(path, 'base64');
+        // @ts-ignore
+        return new Response(Buffer.from(content, 'base64').buffer, reqOptions);
+    } else {
+        return new Response('', reqOptions);
+    }
+}
+
+
+/**
  * Determines whether the given string is a valid HTTP or HTTPS URL.
  * @param {string|URL} string The string to test for validity as an HTTP or HTTPS URL.
  * @param {string[]} [validHosts=null] A list of valid hostnames. If specified, the URL's hostname must be in this list.
@@ -167,7 +333,36 @@ function isValidHttpUrl(string, validHosts = null) {
     if (validHosts && !validHosts.includes(url.hostname)) {
         return false;
     }
-    return url.protocol === "http:" || url.protocol === "https:";
+    return IS_REACT_NATIVE
+        // @ts-ignore
+        ? /^https?:/.test(string)
+        : url.protocol === "http:" || url.protocol === "https:";
+}
+/**
+ * Helper function to download a file.
+ *
+ * @param {URL|string} fromUrl The URL/path of the file to download.
+ * @param {string} toFile The path of the file to download to.
+ * @param {function} progress_callback A callback function that is called with progress information.
+ * @returns {Promise}
+ */
+export async function downloadFile(fromUrl, toFile, progress_callback) {
+    // @ts-ignore
+    fs.mkdir(path.dirname(toFile));
+    // @ts-ignore
+    const { jobId, promise } = fs.downloadFile({
+        fromUrl,
+        toFile,
+        progressInterval: 200,
+        progress: ({ contentLength, bytesWritten }) => {
+            progress_callback({
+                progress: bytesWritten / contentLength,
+                loaded: bytesWritten,
+                total: contentLength,
+            });
+        },
+    });
+    await promise;
 }
 
 /**
@@ -178,34 +373,44 @@ function isValidHttpUrl(string, validHosts = null) {
  */
 export async function getFile(urlOrPath) {
 
-    if (env.useFS && !isValidHttpUrl(urlOrPath)) {
-        return new FileResponse(urlOrPath);
-
-    } else if (typeof process !== 'undefined' && process?.release?.name === 'node') {
-        const IS_CI = !!process.env?.TESTING_REMOTELY;
-        const version = env.version;
-
-        const headers = new Headers();
-        headers.set('User-Agent', `transformers.js/${version}; is_ci/${IS_CI};`);
-
-        // Check whether we are making a request to the Hugging Face Hub.
-        const isHFURL = isValidHttpUrl(urlOrPath, ['huggingface.co', 'hf.co']);
-        if (isHFURL) {
-            // If an access token is present in the environment variables,
-            // we add it to the request headers.
-            // NOTE: We keep `HF_ACCESS_TOKEN` for backwards compatibility (as a fallback).
-            const token = process.env?.HF_TOKEN ?? process.env?.HF_ACCESS_TOKEN;
-            if (token) {
-                headers.set('Authorization', `Bearer ${token}`);
-            }
+    if (IS_REACT_NATIVE) {
+        if (env.useFS && !isValidHttpUrl(urlOrPath)) {
+            return readFile(urlOrPath);
+        } else {
+            return fetchBinary(urlOrPath);
         }
-        return fetch(urlOrPath, { headers });
     } else {
-        // Running in a browser-environment, so we use default headers
-        // NOTE: We do not allow passing authorization headers in the browser,
-        // since this would require exposing the token to the client.
-        return fetch(urlOrPath);
+        if (env.useFS && !isValidHttpUrl(urlOrPath)) {
+            return new FileResponse(urlOrPath);
+    
+        } else if (typeof process !== 'undefined' && process?.release?.name === 'node') {
+            const IS_CI = !!process.env?.TESTING_REMOTELY;
+            const version = env.version;
+    
+            const headers = new Headers();
+            headers.set('User-Agent', `transformers.js/${version}; is_ci/${IS_CI};`);
+    
+            // Check whether we are making a request to the Hugging Face Hub.
+            const isHFURL = isValidHttpUrl(urlOrPath, ['huggingface.co', 'hf.co']);
+            if (isHFURL) {
+                // If an access token is present in the environment variables,
+                // we add it to the request headers.
+                // NOTE: We keep `HF_ACCESS_TOKEN` for backwards compatibility (as a fallback).
+                const token = process.env?.HF_TOKEN ?? process.env?.HF_ACCESS_TOKEN;
+                if (token) {
+                    headers.set('Authorization', `Bearer ${token}`);
+                }
+            }
+            return fetch(urlOrPath, { headers });
+        } else {
+            // Running in a browser-environment, so we use default headers
+            // NOTE: We do not allow passing authorization headers in the browser,
+            // since this would require exposing the token to the client.
+            return fetch(urlOrPath);
+        }
     }
+
+   
 }
 
 const ERROR_MAPPING = {
@@ -260,10 +465,27 @@ class FileCache {
         let filePath = path.join(this.path, request);
         let file = new FileResponse(filePath);
 
-        if (file.exists) {
-            return file;
+        // if (file.exists) {
+        //     return file;
+        // } else {
+        //     return undefined;
+        // }
+        if (IS_REACT_NATIVE) {
+            // @ts-ignore
+            if (await fs.exists(filePath)) {
+                // @ts-ignore
+                return readFile(filePath);
+            } else {
+                return undefined;
+            }
         } else {
             return undefined;
+            let file = new FileResponse(filePath);
+            if (file.exists) {
+                return file;
+            } else {
+                return undefined;
+            }
         }
     }
 
@@ -279,8 +501,18 @@ class FileCache {
         let outputPath = path.join(this.path, request);
 
         try {
-            await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
-            await fs.promises.writeFile(outputPath, buffer);
+            // await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+            // await fs.promises.writeFile(outputPath, buffer);
+
+            if (IS_REACT_NATIVE) {
+                  // @ts-ignore
+                await fs.mkdir(path.dirname(outputPath));
+                  // @ts-ignore
+                await fs.writeFile(outputPath, buffer.toString('base64'), 'base64');
+            } else {
+                await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+                await fs.promises.writeFile(outputPath, buffer);
+            }
 
         } catch (err) {
             console.warn('An error occurred while writing the file to cache:', err)
@@ -329,6 +561,10 @@ async function tryCache(cache, ...names) {
  * @returns {Promise} A Promise that resolves with the file content as a buffer.
  */
 export async function getModelFile(path_or_repo_id, filename, fatal = true, options = {}) {
+    let useDownloadAPI = false;
+
+    /** @type {string} */
+    let remoteURL;
 
     if (!env.allowLocalModels) {
         // User has disabled local models, so we just make sure other settings are correct.
@@ -394,7 +630,7 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     let requestURL = pathJoin(path_or_repo_id, filename);
     let localPath = pathJoin(env.localModelPath, requestURL);
 
-    let remoteURL = pathJoin(
+    remoteURL = pathJoin(
         env.remoteHost,
         env.remotePathTemplate
             .replaceAll('{model}', path_or_repo_id)
@@ -447,6 +683,8 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
                 throw new Error(`\`local_files_only=true\`, but attempted to load a remote file from: ${requestURL}.`);
             } else if (!env.allowRemoteModels) {
                 throw new Error(`\`env.allowRemoteModels=false\`, but attempted to load a remote file from: ${requestURL}.`);
+            } else if (IS_REACT_NATIVE && !env.useFSCache) {
+                throw new Error(`ReactNative cannot load remote files without a cache. Please enable \`env.useFSCache\` to enable caching.`);
             }
         }
 
@@ -468,11 +706,21 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
             }
 
             // File not found locally, so we try to download it from the remote server
-            response = await getFile(remoteURL);
+            // response = await getFile(remoteURL);
 
-            if (response.status !== 200) {
-                return handleError(response.status, remoteURL, fatal);
+            // if (response.status !== 200) {
+            //     return handleError(response.status, remoteURL, fatal);
+            // }
+
+            if (IS_REACT_NATIVE && getMIME(filename) === 'application/octet-stream') {
+                useDownloadAPI = true;
+            } else {
+                response = await getFile(remoteURL);
+                if (response.status !== 200) {
+                    return handleError(response.status, remoteURL, fatal);
+                }
             }
+            
 
             // Success! We use the proposed cache key from earlier
             cacheKey = proposedCacheKey;
@@ -480,7 +728,8 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
 
         // Only cache the response if:
         toCacheResponse =
-            cache                              // 1. A caching system is available
+            cache 
+            && response.headers.get('rn-is-local') !== '1'                             // 1. A caching system is available
             && typeof Response !== 'undefined' // 2. `Response` is defined (i.e., we are in a browser-like environment)
             && response instanceof Response    // 3. result is a `Response` object (i.e., not a `FileResponse`)
             && response.status === 200         // 4. request was successful (status code 200)
@@ -492,6 +741,23 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         name: path_or_repo_id,
         file: filename
     })
+
+    if (useDownloadAPI) {
+        // @ts-ignore
+        const cachePath = path.join(options.cache_dir ?? env.cacheDir, request);
+        await downloadFile(remoteURL, cachePath, data => {
+            dispatchCallback(options.progress_callback, {
+                status: 'progress',
+                ...data,
+                name: path_or_repo_id,
+                file: filename
+            })
+        });
+        response = await getFile(cachePath);
+        if (response.status !== 200) {
+            return handleError(response.status, remoteURL, fatal);
+        }
+    }
 
     const progressInfo = {
         status: 'progress',
@@ -558,7 +824,16 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         file: filename
     });
 
-    return buffer;
+    // return buffer;
+    if (
+        IS_REACT_NATIVE &&
+        response.headers.get('content-type') === 'application/octet-stream'
+    ) {
+        // @ts-ignore
+        return await cache.match(request).then(res => res.url);
+    } else {
+        return buffer;
+    }
 }
 
 /**
@@ -577,7 +852,9 @@ export async function getModelJSON(modelPath, fileName, fatal = true, options = 
         // Return empty object
         return {}
     }
-
+    // @ts-ignore
+    if (IS_REACT_NATIVE) return JSON.parse(Buffer.from(buffer));
+    
     let decoder = new TextDecoder('utf-8');
     let jsonData = decoder.decode(buffer);
 
@@ -600,6 +877,16 @@ async function readResponse(response, progress_callback) {
     let total = parseInt(contentLength ?? '0');
     let buffer = new Uint8Array(total);
     let loaded = 0;
+
+    if (IS_REACT_NATIVE) {
+        if (
+            response.headers.get('content-type') !== 'application/octet-stream' ||
+            response.headers.get('rn-is-local') !== '1'
+        )
+            return await response.arrayBuffer();
+        else
+            return response.url;
+    }
 
     const reader = response.body.getReader();
     async function read() {

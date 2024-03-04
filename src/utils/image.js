@@ -8,19 +8,52 @@
  * @module utils/image
  */
 
+import fs from 'fs';
+import { isString } from './core.js';
 import { getFile } from './hub.js';
 import { env } from '../env.js';
+import { transpose_data, interpolate_data } from './maths.js';
+
+import encode from 'image-encode';
+import decode from 'image-decode';
+import { Buffer } from 'buffer';
 
 // Will be empty (or not used) if running in browser or web-worker
 import sharp from 'sharp';
 
 const BROWSER_ENV = typeof self !== 'undefined';
-const WEBWORKER_ENV = BROWSER_ENV && self.constructor.name === 'DedicatedWorkerGlobalScope';
+const IS_REACT_NATIVE = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
 
 let createCanvasFunction;
 let ImageDataClass;
 let loadImageFunction;
-if (BROWSER_ENV) {
+if (IS_REACT_NATIVE) {
+    // Optional Support `@flyskywhy/react-native-browser-polyfill` for better performance
+    if (typeof document !== 'undefined' && typeof Image !== 'undefined') {
+        createCanvasFunction = (/** @type {number} */ width, /** @type {number} */ height) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            return canvas;
+        };
+        loadImageFunction = async (/**@type {URL|string}*/url) => {
+            const info = await new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => {
+                    const canvas = createCanvasFunction(image.width, image.height);
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(image, 0, 0);
+                    const { data } = ctx.getImageData(0, 0, image.width, image.height);
+                    resolve({ data, width: image.width, height: image.height });
+                }
+                image.onerror = reject;
+                image.src = url;
+            });
+            return new RawImage(info.data, info.width, info.height, 4);
+        };
+        ImageDataClass = global.ImageData;
+    }
+} else if (BROWSER_ENV) {
     // Running in browser or web-worker
     createCanvasFunction = (/** @type {number} */ width, /** @type {number} */ height) => {
         if (!self.OffscreenCanvas) {
@@ -35,18 +68,8 @@ if (BROWSER_ENV) {
     // Running in Node.js, electron, or other non-browser environment
 
     loadImageFunction = async (/**@type {sharp.Sharp}*/img) => {
-        const metadata = await img.metadata();
-        const rawChannels = metadata.channels;
-
         let { data, info } = await img.raw().toBuffer({ resolveWithObject: true });
-
-        const newImage = new RawImage(new Uint8ClampedArray(data), info.width, info.height, info.channels);
-        if (rawChannels !== undefined && rawChannels !== info.channels) {
-            // Make sure the new image has the same number of channels as the input image.
-            // This is necessary for grayscale images.
-            newImage.convert(rawChannels);
-        }
-        return newImage;
+        return new RawImage(new Uint8ClampedArray(data), info.width, info.height, info.channels);
     }
 
 } else {
@@ -64,60 +87,28 @@ const RESAMPLING_MAPPING = {
     5: 'hamming',
 }
 
-/**
- * Mapping from file extensions to MIME types.
- */
-const CONTENT_TYPE_MAP = new Map([
-    ['png', 'image/png'],
-    ['jpg', 'image/jpeg'],
-    ['jpeg', 'image/jpeg'],
-    ['gif', 'image/gif'],
-]);
-
 export class RawImage {
 
     /**
-     * Create a new `RawImage` object.
-     * @param {Uint8ClampedArray|Uint8Array} data The pixel data.
+     * Create a new RawImage object.
+     * @param {Uint8ClampedArray} data The pixel data.
      * @param {number} width The width of the image.
      * @param {number} height The height of the image.
      * @param {1|2|3|4} channels The number of channels.
      */
     constructor(data, width, height, channels) {
-        this.data = data;
-        this.width = width;
-        this.height = height;
-        this.channels = channels;
-    }
-
-    /** 
-     * Returns the size of the image (width, height).
-     * @returns {[number, number]} The size of the image (width, height).
-     */
-    get size() {
-        return [this.width, this.height];
+        this._update(data, width, height, channels);
     }
 
     /**
      * Helper method for reading an image from a variety of input types.
      * @param {RawImage|string|URL} input 
      * @returns The image object.
-     * 
-     * **Example:** Read image from a URL.
-     * ```javascript
-     * let image = await RawImage.read('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/football-match.jpg');
-     * // RawImage {
-     * //   "data": Uint8ClampedArray [ 25, 25, 25, 19, 19, 19, ... ],
-     * //   "width": 800,
-     * //   "height": 533,
-     * //   "channels": 3
-     * // }
-     * ```
      */
     static async read(input) {
         if (input instanceof RawImage) {
             return input;
-        } else if (typeof input === 'string' || input instanceof URL) {
+        } else if (isString(input) || input instanceof URL) {
             return await this.fromURL(input);
         } else {
             throw new Error(`Unsupported input type: ${typeof input}`);
@@ -131,12 +122,18 @@ export class RawImage {
      * @returns {Promise<RawImage>} The image object.
      */
     static async fromURL(url) {
-        let response = await getFile(url);
-        if (response.status !== 200) {
-            throw new Error(`Unable to read image from "${url}" (${response.status} ${response.statusText})`);
+        if (IS_REACT_NATIVE) {
+            if (env.useGCanvas && loadImageFunction) {
+                return await loadImageFunction(url);
+            } else {
+                let response = await getFile(url);
+                return this.fromBlob(response);
+            }
+        } else {
+            let response = await getFile(url);
+            let blob = await response.blob();
+            return this.fromBlob(blob);
         }
-        let blob = await response.blob();
-        return this.fromBlob(blob);
     }
 
     /**
@@ -145,7 +142,11 @@ export class RawImage {
      * @returns {Promise<RawImage>} The image object.
      */
     static async fromBlob(blob) {
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            const buffer = await blob.arrayBuffer();
+            const { data, width, height } = decode(buffer);
+            return new RawImage(new Uint8ClampedArray(data), width, height, 4);
+        } else if (BROWSER_ENV) {
             // Running in environment with canvas
             let img = await loadImageFunction(blob);
 
@@ -165,36 +166,6 @@ export class RawImage {
     }
 
     /**
-     * Helper method to create a new Image from a tensor
-     * @param {import('./tensor.js').Tensor} tensor 
-     */
-    static fromTensor(tensor, channel_format = 'CHW') {
-        if (tensor.dims.length !== 3) {
-            throw new Error(`Tensor should have 3 dimensions, but has ${tensor.dims.length} dimensions.`);
-        }
-
-        if (channel_format === 'CHW') {
-            tensor = tensor.transpose(1, 2, 0);
-        } else if (channel_format === 'HWC') {
-            // Do nothing
-        } else {
-            throw new Error(`Unsupported channel format: ${channel_format}`);
-        }
-        if (!(tensor.data instanceof Uint8ClampedArray || tensor.data instanceof Uint8Array)) {
-            throw new Error(`Unsupported tensor type: ${tensor.type}`);
-        }
-        switch (tensor.dims[2]) {
-            case 1:
-            case 2:
-            case 3:
-            case 4:
-                return new RawImage(tensor.data, tensor.dims[1], tensor.dims[0], tensor.dims[2]);
-            default:
-                throw new Error(`Unsupported number of channels: ${tensor.dims[2]}`);
-        }
-    }
-
-    /**
      * Convert the image to grayscale format.
      * @returns {RawImage} `this` to support chaining.
      */
@@ -203,7 +174,7 @@ export class RawImage {
             return this;
         }
 
-        let newData = new Uint8ClampedArray(this.width * this.height * 1);
+        let newData = new Uint8ClampedArray(this.width * this.height * 3);
         switch (this.channels) {
             case 3: // rgb to grayscale
             case 4: // rgba to grayscale
@@ -304,7 +275,39 @@ export class RawImage {
         // Ensure resample method is a string
         let resampleMethod = RESAMPLING_MAPPING[resample] ?? resample;
 
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let canvas = createCanvasFunction(this.width, this.height);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, 0, 0);
+                ctx.drawImage(canvas, 0, 0, this.width, this.height, 0, 0, width, height);
+                let newImageData = ctx.getImageData(0, 0, width, height);
+                const resized = new RawImage(newImageData.data, width, height, 4);
+                return resized.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                // WHC -> CHW
+                const [trsnsposed] = transpose_data(
+                    this.data,
+                    [this.width, this.height, this.channels],
+                    [2, 0, 1]
+                );
+                const resized = interpolate_data(
+                    trsnsposed,
+                    [this.channels, this.height, this.width],
+                    [height, width]
+                );
+                // CHW -> WHC
+                const [newData] = transpose_data(
+                    resized,
+                    [this.channels, height, width],
+                    [1, 2, 0]
+                );
+                return new RawImage(newData, width, height, this.channels);
+            }
+        } else if (BROWSER_ENV) {
             // TODO use `resample` in browser environment
 
             // Store number of channels before resizing
@@ -327,7 +330,13 @@ export class RawImage {
 
         } else {
             // Create sharp image from raw data, and resize
-            let img = this.toSharp();
+            let img = sharp(this.data, {
+                raw: {
+                    width: this.width,
+                    height: this.height,
+                    channels: this.channels
+                }
+            });
 
             switch (resampleMethod) {
                 case 'box':
@@ -377,7 +386,37 @@ export class RawImage {
             return this;
         }
 
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let newWidth = this.width + left + right;
+                let newHeight = this.height + top + bottom;
+                let canvas = createCanvasFunction(newWidth, newHeight);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, left, top);
+                let newImageData = ctx.getImageData(0, 0, newWidth, newHeight);
+                const padded = new RawImage(newImageData.data, newWidth, newHeight, 4);
+                return padded.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                const channels = this.channels;
+                const data = this.data;
+                const width = this.width + left + right;
+                const height = this.height + top + bottom;
+                const paddedData = new Uint8ClampedArray(width * height * channels);
+                for (let i = 0; i < data.length; i += channels) {
+                    const x = Math.floor(i / channels) % this.width;
+                    const y = Math.floor(i / channels / this.width);
+                    const pixelIndex = (y * width + x) * channels;
+                    for (let j = 0; j < channels; j++) {
+                        paddedData[pixelIndex + j] = data[i + j];
+                    }
+                }
+                return new RawImage(paddedData, width, height, channels);
+            }
+
+        } else if (BROWSER_ENV) {
             // Store number of channels before padding
             let numChannels = this.channels;
 
@@ -405,61 +444,15 @@ export class RawImage {
             return paddedImage.convert(numChannels);
 
         } else {
-            let img = this.toSharp().extend({ left, right, top, bottom });
+            let img = sharp(this.data, {
+                raw: {
+                    width: this.width,
+                    height: this.height,
+                    channels: this.channels
+                }
+            }).extend({ left, right, top, bottom });
             return await loadImageFunction(img);
         }
-    }
-
-    async crop([x_min, y_min, x_max, y_max]) {
-        // Ensure crop bounds are within the image
-        x_min = Math.max(x_min, 0);
-        y_min = Math.max(y_min, 0);
-        x_max = Math.min(x_max, this.width - 1);
-        y_max = Math.min(y_max, this.height - 1);
-
-        // Do nothing if the crop is the entire image
-        if (x_min === 0 && y_min === 0 && x_max === this.width - 1 && y_max === this.height - 1) {
-            return this;
-        }
-
-        const crop_width = x_max - x_min + 1;
-        const crop_height = y_max - y_min + 1;
-
-        if (BROWSER_ENV) {
-            // Store number of channels before resizing
-            const numChannels = this.channels;
-
-            // Create canvas object for this image
-            const canvas = this.toCanvas();
-
-            // Create a new canvas of the desired size. This is needed since if the 
-            // image is too small, we need to pad it with black pixels.
-            const ctx = createCanvasFunction(crop_width, crop_height).getContext('2d');
-
-            // Draw image to context, cropping in the process
-            ctx.drawImage(canvas,
-                x_min, y_min, crop_width, crop_height,
-                0, 0, crop_width, crop_height
-            );
-
-            // Create image from the resized data
-            const resizedImage = new RawImage(ctx.getImageData(0, 0, crop_width, crop_height).data, crop_width, crop_height, 4);
-
-            // Convert back so that image has the same number of channels as before
-            return resizedImage.convert(numChannels);
-
-        } else {
-            // Create sharp image from raw data
-            const img = this.toSharp().extract({
-                left: x_min,
-                top: y_min,
-                width: crop_width,
-                height: crop_height,
-            });
-
-            return await loadImageFunction(img);
-        }
-
     }
 
     async center_crop(crop_width, crop_height) {
@@ -472,8 +465,32 @@ export class RawImage {
         let width_offset = (this.width - crop_width) / 2;
         let height_offset = (this.height - crop_height) / 2;
 
-
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let canvas = createCanvasFunction(crop_width, crop_height);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, -width_offset, -height_offset);
+                let newImageData = ctx.getImageData(0, 0, crop_width, crop_height);
+                const cropped = new RawImage(newImageData.data, crop_width, crop_height, 4);
+                return cropped.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                let channels = this.channels;
+                let data = this.data;
+                let croppedData = new Uint8ClampedArray(crop_width * crop_height * channels);
+                for (let i = 0; i < croppedData.length; i += channels) {
+                    const x = Math.floor(i / channels) % crop_width;
+                    const y = Math.floor(i / channels / crop_width);
+                    const pixelIndex = ((y + height_offset) * this.width + (x + width_offset)) * channels;
+                    for (let j = 0; j < channels; j++) {
+                        croppedData[i + j] = data[pixelIndex + j];
+                    }
+                }
+                return new RawImage(croppedData, crop_width, crop_height, channels);
+            }
+        } else if (BROWSER_ENV) {
             // Store number of channels before resizing
             let numChannels = this.channels;
 
@@ -515,7 +532,13 @@ export class RawImage {
 
         } else {
             // Create sharp image from raw data
-            let img = this.toSharp();
+            let img = sharp(this.data, {
+                raw: {
+                    width: this.width,
+                    height: this.height,
+                    channels: this.channels
+                }
+            });
 
             if (width_offset >= 0 && height_offset >= 0) {
                 // Cropped image lies entirely within the original image
@@ -577,20 +600,19 @@ export class RawImage {
         }
     }
 
-    async toBlob(type = 'image/png', quality = 1) {
-        if (!BROWSER_ENV) {
-            throw new Error('toBlob() is only supported in browser environments.')
-        }
+    toImageData() {
+        if (IS_REACT_NATIVE && ImageDataClass === undefined)
+            throw new Error('toImageData is not supported');
+        // Clone, and convert data to RGBA before create ImageData object.
+        // This is because the ImageData API only supports RGBA
+        let cloned = this.clone().rgba();
 
-        const canvas = this.toCanvas();
-        return await canvas.convertToBlob({ type, quality });
+        return new ImageDataClass(cloned.data, cloned.width, cloned.height);
     }
 
     toCanvas() {
-        if (!BROWSER_ENV) {
-            throw new Error('toCanvas() is only supported in browser environments.')
-        }
-
+        if (IS_REACT_NATIVE && createCanvasFunction === undefined)
+            throw new Error('toCanvas is not supported');
         // Clone, and convert data to RGBA before drawing to canvas.
         // This is because the canvas API only supports RGBA
         let cloned = this.clone().rgba();
@@ -610,8 +632,7 @@ export class RawImage {
      * @param {Uint8ClampedArray} data The new image data.
      * @param {number} width The new width of the image.
      * @param {number} height The new height of the image.
-     * @param {1|2|3|4|null} [channels] The new number of channels of the image.
-     * @private
+     * @param {1|2|3|4} channels The new number of channels of the image.
      */
     _update(data, width, height, channels = null) {
         this.data = data;
@@ -656,58 +677,22 @@ export class RawImage {
     }
 
     /**
-     * Save the image to the given path.
-     * @param {string} path The path to save the image to.
+     * Save the image to the given path. This method is only available in environments with access to the FileSystem.
+     * @param {string|Buffer|URL} path The path to save the image to.
+     * @param {string} [mime='image/png'] The mime type of the image.
      */
-    async save(path) {
-
-        if (BROWSER_ENV) {
-            if (WEBWORKER_ENV) {
-                throw new Error('Unable to save an image from a Web Worker.')
-            }
-
-            const extension = path.split('.').pop().toLowerCase();
-            const mime = CONTENT_TYPE_MAP.get(extension) ?? 'image/png';
-
-            // Convert image to Blob
-            const blob = await this.toBlob(mime);
-
-            // Convert the canvas content to a data URL
-            const dataURL = URL.createObjectURL(blob);
-
-            // Create an anchor element with the data URL as the href attribute
-            const downloadLink = document.createElement('a');
-            downloadLink.href = dataURL;
-
-            // Set the download attribute to specify the desired filename for the downloaded image
-            downloadLink.download = path;
-
-            // Trigger the download
-            downloadLink.click();
-
-            // Clean up: remove the anchor element from the DOM
-            downloadLink.remove();
-
-        } else if (!env.useFS) {
+    save(path, mime = 'image/png') {
+        if (!env.useFS) {
             throw new Error('Unable to save the image because filesystem is disabled in this environment.')
+        }
 
+        if (IS_REACT_NATIVE) {
+            const buf = Buffer.from(encode(this.rgba().data, mime));
+            fs.writeFile(path, buf.toString('base64'), 'base64');
         } else {
-            const img = this.toSharp();
-            return await img.toFile(path);
+            let canvas = this.toCanvas();
+            const buffer = canvas.toBuffer(mime);
+            fs.writeFileSync(path, buffer);
         }
-    }
-
-    toSharp() {
-        if (BROWSER_ENV) {
-            throw new Error('toSharp() is only supported in server-side environments.')
-        }
-
-        return sharp(this.data, {
-            raw: {
-                width: this.width,
-                height: this.height,
-                channels: this.channels
-            }
-        });
     }
 }
